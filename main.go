@@ -62,6 +62,7 @@ var (
 	mode        string
 	concurrency int
 	maximumRate int
+	minimumRate int
 
 	testDuration time.Duration
 
@@ -228,6 +229,21 @@ func toInt(value bool) int {
 	}
 }
 
+type noRetryPolicy struct {
+	PrintVerdict bool //Do we print the verdict of the retry?
+}
+
+// Attempt tells gocql to attempt the query again based on query.Attempts being less
+// than the NumRetries defined in the policy.
+func (s *noRetryPolicy) Attempt(q gocql.RetryableQuery) bool {
+	return false
+}
+
+func (s *noRetryPolicy) GetRetryType(err error) gocql.RetryType {
+
+	return gocql.Rethrow
+}
+
 func main() {
 	var (
 		workload          string
@@ -260,6 +276,7 @@ func main() {
 	flag.IntVar(&concurrency, "concurrency", 16, "number of used goroutines")
 	flag.IntVar(&connectionCount, "connection-count", 4, "number of connections")
 	flag.IntVar(&maximumRate, "max-rate", 0, "the maximum rate of outbound requests in op/s (0 for unlimited)")
+	flag.IntVar(&minimumRate, "min-rate", 0, "the minimum rate of outbound requests in op/s (0 for no minimum)")
 	flag.IntVar(&pageSize, "page-size", 1000, "page size")
 
 	flag.Int64Var(&partitionCount, "partition-count", 10000, "number of partitions")
@@ -355,10 +372,41 @@ func main() {
 		log.Fatal("max-rate must be provided for time series write loads")
 	}
 
+	if minimumRate != 0 && maximumRate != 0 {
+		log.Fatal("max-rate and min-rate can't be both different than 0")
+	} else if minimumRate != 0 {
+		const streamsPerConnection int = 32768
+		// we use some variation of Little's law in order to
+		// calculate the timeout that can produce our minimum
+		// rate (rate-per-thread)*concurency = throughput =>
+		var maxLatencyPerOp float32 = float32(concurrency) / float32(minimumRate)
+		// if the latency per op is unreasonably low - increase the (real) concurency
+		if maxLatencyPerOp < 0.002 {
+			var newConcurency int = int(0.002 * float32(minimumRate))
+			fmt.Println("The concurency is too low (", concurrency, ") for maintaining a reasonable clinet timeout bumpint it up to", newConcurency)
+			concurrency = newConcurency
+			maxLatencyPerOp = 0.002
+		}
+		timeout = time.Duration(int(float32(time.Second) * maxLatencyPerOp))
+
+		// check that there are enough connections open to accomadate this
+		var maxInFlightQueries int = int(float32(minimumRate) * maxLatencyPerOp)
+		var minConnectionsCount int = (maxInFlightQueries / streamsPerConnection) + 5
+		if minConnectionsCount > connectionCount {
+			fmt.Println("Not enough connections were set (", connectionCount, ") bumping up the number of connections to", minConnectionsCount)
+			connectionCount = minConnectionsCount
+		}
+	}
+
 	cluster := gocql.NewCluster(strings.Split(nodes, ",")...)
 	cluster.NumConns = connectionCount
 	cluster.PageSize = pageSize
 	cluster.Timeout = timeout
+
+	if minimumRate != 0 {
+		cluster.RetryPolicy = &noRetryPolicy{}
+	}
+
 	if tls {
 		cluster.SslOpts = &gocql.SslOptions{}
 	}
